@@ -1,0 +1,189 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: CI
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.2"
+          extensions: mbstring, sqlite, pdo_sqlite, tokenizer, xml, ctype, json, bcmath, fileinfo
+          coverage: none
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install PHP dependencies
+        run: composer install --prefer-dist --no-interaction --no-progress
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Tests
+        run: npm test
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Upload build artifact
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: actions/upload-artifact@v4
+        with:
+          name: public-build
+          path: public/build
+          retention-days: 1
+
+  deploy:
+    name: Deploy AlwaysData
+    needs: ci
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: public-build
+          path: public/build
+
+      - name: Validate secrets
+        env:
+          ALWAYSDATA_HOST: ${{ secrets.ALWAYSDATA_HOST }}
+          ALWAYSDATA_USER: ${{ secrets.ALWAYSDATA_USER }}
+          ALWAYSDATA_PASSWORD: ${{ secrets.ALWAYSDATA_PASSWORD }}
+          ALWAYSDATA_PATH: ${{ secrets.ALWAYSDATA_PATH }}
+          APP_KEY: ${{ secrets.APP_KEY }}
+          APP_URL: ${{ secrets.APP_URL }}
+        run: |
+          set -euo pipefail
+          for key in ALWAYSDATA_HOST ALWAYSDATA_USER ALWAYSDATA_PASSWORD ALWAYSDATA_PATH APP_KEY APP_URL; do
+            if [ -z "${!key:-}" ]; then
+              echo "Missing GitHub secret: $key" >&2
+              exit 1
+            fi
+          done
+
+      - name: Install sshpass
+        run: sudo apt-get update && sudo apt-get install -y sshpass
+
+      - name: Add AlwaysData host key
+        env:
+          ALWAYSDATA_HOST: ${{ secrets.ALWAYSDATA_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          ssh-keyscan -H "$ALWAYSDATA_HOST" >> ~/.ssh/known_hosts
+
+      - name: Sync files
+        env:
+          ALWAYSDATA_HOST: ${{ secrets.ALWAYSDATA_HOST }}
+          ALWAYSDATA_USER: ${{ secrets.ALWAYSDATA_USER }}
+          ALWAYSDATA_PASSWORD: ${{ secrets.ALWAYSDATA_PASSWORD }}
+          ALWAYSDATA_PATH: ${{ secrets.ALWAYSDATA_PATH }}
+          SSHPASS: ${{ secrets.ALWAYSDATA_PASSWORD }}
+        run: |
+          set -euo pipefail
+          export SSHPASS
+          sshpass -e ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no \
+            "$ALWAYSDATA_USER@$ALWAYSDATA_HOST" "mkdir -p '$ALWAYSDATA_PATH'"
+          sshpass -e rsync -az --delete \
+            -e "ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no" \
+            --exclude '.git/' \
+            --exclude '.github/' \
+            --exclude 'node_modules/' \
+            --exclude 'vendor/' \
+            --exclude 'tests/' \
+            --exclude '.env' \
+            --exclude '.env.*' \
+            --exclude 'database/*.sqlite' \
+            --exclude 'database/*.sqlite-journal' \
+            --exclude 'storage/logs/' \
+            --exclude 'storage/framework/cache/' \
+            --exclude 'storage/framework/sessions/' \
+            --exclude 'storage/framework/views/' \
+            --exclude 'storage/framework/testing/' \
+            ./ "$ALWAYSDATA_USER@$ALWAYSDATA_HOST:$ALWAYSDATA_PATH/"
+
+      - name: Bootstrap and artisan
+        env:
+          ALWAYSDATA_HOST: ${{ secrets.ALWAYSDATA_HOST }}
+          ALWAYSDATA_USER: ${{ secrets.ALWAYSDATA_USER }}
+          ALWAYSDATA_PATH: ${{ secrets.ALWAYSDATA_PATH }}
+          APP_KEY: ${{ secrets.APP_KEY }}
+          APP_URL: ${{ secrets.APP_URL }}
+          SSHPASS: ${{ secrets.ALWAYSDATA_PASSWORD }}
+        run: |
+          set -euo pipefail
+          export SSHPASS
+          sshpass -e ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no \
+            "$ALWAYSDATA_USER@$ALWAYSDATA_HOST" \
+            "export ALWAYSDATA_PATH=$(printf %q "$ALWAYSDATA_PATH"); export APP_KEY=$(printf %q "$APP_KEY"); export APP_URL=$(printf %q "$APP_URL"); bash -s" <<'EOF'
+          set -euo pipefail
+          cd "$ALWAYSDATA_PATH"
+
+          if [ ! -f .env ]; then
+            cp .env.example .env
+            php -r '
+              $path = ".env";
+              $env = file_get_contents($path);
+              $vars = [
+                "APP_ENV" => "production",
+                "APP_DEBUG" => "false",
+                "APP_KEY" => getenv("APP_KEY"),
+                "APP_URL" => getenv("APP_URL"),
+                "DB_CONNECTION" => "sqlite",
+                "LOG_LEVEL" => "error",
+              ];
+              foreach ($vars as $key => $value) {
+                  $env = preg_replace("/^{$key}=.*/m", $key."=".$value, $env);
+              }
+              file_put_contents($path, $env);
+            '
+          fi
+
+          mkdir -p storage/framework/{cache,sessions,views} storage/logs bootstrap/cache database
+          chmod -R ug+rwx storage bootstrap/cache database
+          rm -f public/hot
+
+          composer install --no-dev --optimize-autoloader --no-interaction --no-progress
+
+          FRESH_DB=0
+          if [ ! -f database/database.sqlite ]; then
+            touch database/database.sqlite
+            chmod ug+rw database/database.sqlite
+            FRESH_DB=1
+          fi
+
+          if [ "$FRESH_DB" -eq 1 ]; then
+            php artisan migrate --seed --force
+          else
+            php artisan migrate --force
+          fi
+
+          php artisan config:cache
+          php artisan route:cache
+          php artisan view:cache
+          EOF
