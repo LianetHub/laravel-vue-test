@@ -1,0 +1,13 @@
+vendor
+node_modules
+public/build
+public/hot
+storage
+bootstrap/cache
+dist
+coverage
+*.min.js
+*.min.css
+package-lock.json
+composer.lock
+database/database.sqlite

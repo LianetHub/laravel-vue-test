@@ -1,0 +1,43 @@
+@use "variables" as *;
+
+@mixin mq-max($bp) {
+    @media (max-width: $bp) {
+        @content;
+    }
+}
+
+@mixin mq-min($bp) {
+    @media (min-width: $bp) {
+        @content;
+    }
+}
+
+@mixin mq-between($min, $max) {
+    @media (max-width: $max) and (min-width: $min) {
+        @content;
+    }
+}
+
+@mixin mq-sm {
+    @include mq-max($bp-sm) {
+        @content;
+    }
+}
+
+@mixin mq-md {
+    @include mq-max($bp-md) {
+        @content;
+    }
+}
+
+@mixin mq-lg {
+    @include mq-max($bp-lg) {
+        @content;
+    }
+}
+
+@mixin mq-xl-only {
+    @include mq-between($bp-lg + 1, $bp-xl) {
+        @content;
+    }
+}
